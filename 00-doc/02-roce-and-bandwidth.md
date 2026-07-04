@@ -1,11 +1,12 @@
 # RoCE 与内存带宽总结
 
-> 记录两件互相关联的事:(1) 集群互联的 RoCE / RDMA / TCP-over-RoCE 到底是什么;(2) 各类内存带宽的数量级,以及为什么 Spark 的 273 GB/s 是 decode 的硬约束。两者共同决定了本项目的性能天花板。
+> 记录三件互相关联的事:(1) 集群互联的 RoCE / RDMA / TCP-over-RoCE 到底是什么;(2) 数据搬运的四个层级(片上内存 / NVLink / 网络 RDMA / TCP)的带宽全景;(3) 各类内存带宽的数量级,以及为什么 Spark 的 273 GB/s 是 decode 的硬约束。三者共同决定了本项目的性能天花板。
 
 ## 0. 一句话结论
 
 - **RoCE** = 在以太网上跑 RDMA(网卡直接读写对端内存、绕过 CPU/内核)。你的 200G ConnectX-7 网卡支持它。
 - 但你现在跑的是 **TCP-over-RoCE**:用着 RoCE 网卡和线,却因为没有无损交换机而退回普通 TCP socket,**没开 RDMA**。这是剩下最大的性能 lever(RDMA 可带来 ~3× 更低 PP 延迟)。
+- 数据搬运有四个层级、每下一层慢约一个数量级:**片上内存(1–8 TB/s)> NVLink(0.6–1.8 TB/s)> 网络 RDMA(~50 GB/s)> TCP-over-RoCE(~25 GB/s)**。Spark 节点间**没有 NVLink**,只能靠最慢的两档以太网,而且现在停在最慢的 TCP 档。
 - **内存带宽**上,真正的鸿沟是 **HBM(几 TB/s)vs 其它一切(≤1 TB/s)**。Spark 用窄总线 LPDDR5x,只有 **273 GB/s**,比 H100 慢一个数量级还多 —— 这是 decode 卡在 ~4.4 tok/s 的根因。
 
 ---
@@ -46,9 +47,86 @@ CONTAINER_NCCL_SOCKET_IFNAME=enp1s0f0np0,...   # 走 Socket(TCP)
 - **代价**:PP 每 token 要过 3 个 stage 边界传激活,TCP 路径的额外延迟直接叠加到 decode 上。`.env` 注释自估:换 RDMA 能带来 **~3× 更低的 PP 延迟**。
 - **解锁方式**:加一台支持无损以太网的交换机(文档点名的 **MikroTik CRS804**),即 [00-analysis-solution-review.md](00-analysis-solution-review.md) 里「唯一剩下的结构性 lever」。
 
+### 1.6 IB vs RoCE(RDMA 的两种传输)
+
+两者都是跑 RDMA 的方式,带宽同代同档,区别在底层网络与成本:
+
+| 维度 | InfiniBand | RoCE |
+|---|---|---|
+| 本质 | 专用网络协议栈 | 在**以太网**上跑 RDMA |
+| 无损 | **天生无损**(链路层流控) | 以太网会丢包,须配 **PFC + ECN** |
+| 交换机 | 专用 IB 交换机(贵) | 标准以太网交换机(便宜) |
+| 延迟 | 最低 ~1 μs | 略高 ~1–2 μs |
+| 生态/成本 | NVIDIA 一家,贵、省心 | 多厂商,便宜、但配置脆弱 |
+
+**一句话**:IB 用钱换省心与确定性;RoCE 用运维复杂度换成本。Spark 走便宜路线选 RoCE,但要开 RDMA 仍需一台无损以太网交换机 —— 否则只能退到 TCP-over-RoCE。
+
+三档由便宜到贵、由慢到快:**TCP-over-RoCE(现在)< RDMA-over-RoCE(加无损交换机)< InfiniBand(换专网,Spark 场景不现实)**。
+
 ---
 
-## 第二部分:内存带宽的数量级
+## 第二部分:互联层级全景(NVLink vs RDMA vs RoCE)
+
+先厘清概念:**RDMA 是「技术」,RoCE 和 InfiniBand 是它的两种「传输方式」,NVLink 则是完全不同的东西** —— 它是 GPU 之间的直连总线,不走网络。所以真正该对比的是「数据搬运的几个层级速度」。
+
+### 2.1 NVLink 各代带宽(GPU↔GPU 直连)
+
+| 代次 | 代表 GPU | 单 GPU 聚合带宽(双向) |
+|---|---|---|
+| NVLink 2.0 | V100 | 300 GB/s |
+| NVLink 3.0 | A100 | 600 GB/s |
+| **NVLink 4.0** | **H100** | **900 GB/s** |
+| **NVLink 5.0** | **B200** | **1,800 GB/s(1.8 TB/s)** |
+
+配合 **NVSwitch** 可把一整柜 GPU 连成一个 NVLink 域(如 GB200 NVL72:72 张卡每张 1.8 TB/s 全互联)。
+
+### 2.2 四个层级横向对比
+
+| 层级 | 干什么 | 走什么 | 带宽 | 延迟 |
+|---|---|---|---|---|
+| **① 片上内存** | GPU 读自己显存 | HBM3 / GDDR7 | **1–8 TB/s** | ns |
+| **② NVLink** | 同机 GPU↔GPU | 专用总线 | **0.6–1.8 TB/s** | 亚 μs |
+| **③ 网络 RDMA**(Spark 若开启) | 跨机 node↔node,RDMA | RoCE @ **200G**/口 | **~25 GB/s**(200 Gb/s ÷ 8) | ~1–2 μs |
+| **④ TCP-over-RoCE**(你现在) | 跨机,同网卡跑 TCP | RoCE @ 200G/口 | ~25 GB/s 标称,实际更差 | 高(过内核栈) |
+
+> **关于「200G / 400G」**:这是**每口线速率**的命名,单位是**比特**(Gb/s),换成字节要 **÷8**(200 Gb/s = 25 GB/s,400 Gb/s = 50 GB/s)。它也是速率代次名 —— IB 有 EDR/HDR/**NDR**(400G)/XDR,以太网有 100/200/**400**/800 GbE,一一对应。
+> **注意本表按 Spark 实际硬件(ConnectX-7 = 200G 双口)对齐**,所以 ③ 和 ④ 的差别是 **RDMA vs TCP**(同为 200G),而非速率不同。高端集群常用 400G(NDR,≈50 GB/s)甚至 800G,但那不是 Spark 的配置。
+
+**③ 与 ④ 的关键区别不在带宽,而在延迟和 CPU 开销**:同样 200G 线速,RDMA 绕过内核直写内存(~μs、CPU 几乎不参与),TCP 要过内核协议栈两次拷贝(延迟高得多)。PP 是延迟敏感型通信,所以升级 ④→③ 的收益主要来自**延迟**(~3×),而非峰值带宽。
+
+### 2.3 关键认知:每下一层慢约一个数量级
+
+```
+片上内存 (HBM)  ~3,350 GB/s   ← H100
+    ↓  约 3–4×
+NVLink          ~900 GB/s     ← H100 GPU 之间
+    ↓  约 18×
+网络 RDMA        ~50 GB/s     ← RoCE/IB 跨机(400G 级;Spark 的 200G 口约 25 GB/s)
+    ↓  再打折(延迟为主)
+TCP-over-RoCE    ~25 GB/s + 高延迟  ← 你现在(Spark 200G 口)
+```
+
+- **RDMA vs RoCE**:不是并列关系。RDMA = 网卡直写对端内存、绕过 CPU 的**技术**;RoCE = 在以太网上实现 RDMA 的一种**方式**(另一种是 InfiniBand)。两者带宽同档(400G 级 ≈ 50 GB/s),差别在 RoCE 用普通以太网交换机、IB 用专用交换机。
+- **NVLink vs 网络 RDMA**:NVLink 比跨机 RDMA 快 **~20–70 倍**,因为它是机箱内的物理总线,不过网络。
+
+### 2.4 对 Spark 项目意味着什么
+
+残酷的事实:**Spark 节点之间根本没有 NVLink** —— 每台单 GPU,三台只能靠 ③/④ 那档以太网连。而你现在还停在**最慢的第 ④ 档(TCP-over-RoCE)**:
+
+```
+理想大集群:  GPU 之间走 NVLink (900+ GB/s)
+你的 Spark:  节点之间走 TCP-over-RoCE (~25 GB/s + 高延迟)
+```
+
+PP 每 token 跨 3 个 stage 的通信,吃的是整条链路里**最慢的一环**。升级路径两级:
+1. **④ → ③(TCP-over-RoCE → RDMA-over-RoCE)**:加无损交换机,同档内提速,~3× 更低延迟。**这是唯一可做的。**
+2. **③ → ②(网络 → NVLink)**:做不到,Spark 硬件根本没有 NVLink —— 这是廉价方案的天花板。
+
+一句话:**NVLink 是「机箱内高速路(百 GB/s~TB/s)」,RoCE/IB RDMA 是「机房内普通路(几十 GB/s)」,而你现在连普通路都没跑满(TCP 而非 RDMA)。**
+
+---
+
+## 第三部分:内存带宽的数量级
 
 ### 2.1 三档带宽对照
 
@@ -80,7 +158,7 @@ CONTAINER_NCCL_SOCKET_IFNAME=enp1s0f0np0,...   # 走 Socket(TCP)
 
 ---
 
-## 第三部分:两者如何共同决定性能天花板
+## 第四部分:内存带宽与互联如何共同决定性能天花板
 
 LLM decode 是 **memory-bound**(每 token 要把激活到的权重从内存读一遍),直接吃内存带宽:
 
