@@ -31,7 +31,7 @@
 ## 设计上真正受限之处(且文档诚实地承认了)
 
 - **RoCE 跑的是 TCP socket,不是 RDMA。** 起初我想标记「你有 200G ConnectX-7 闲置」,但 `.env.example:26-35` 澄清得很对:直连 ring 拓扑没有交换机,所以是 *RoCE 端口上的 Socket transport*。RDMA(按你自己估计 ~3× 更低 PP 延迟)需要你没有的托管交换机。这是真实的硬件限制,文档记录良好 —— 不是设计缺陷。**但这是你剩下最大的一个 lever**:一台约 $500 的交换机(你甚至点名了 MikroTik CRS804)可显著削减 3-hop PP 同步成本。值得作为头号升级路径写明,而不是埋在注释里。
-- **运维脆弱性是真实的。** OOM → 节点需要**物理**重启上电,外加 OOM-fixer daemon + cache-dropper daemon + posix_fadvise 补丁 + swap,全都在打「统一内存下 page cache 抢 GPU 显存」这场仗。能跑,但一直贴着边缘。这是单用户、有耐心操作者的配置,不是生产环境。troubleshooting 章节对此相当诚实。
+- **运维脆弱性是真实的。** OOM → 节点需要**物理**重启上电,外加 OOM-fixer daemon（/ˈdiːmən/） + cache-dropper daemon + posix_fadvise 补丁 + swap,全都在打「统一内存下 page cache 抢 GPU 显存」这场仗。能跑,但一直贴着边缘。这是单用户、有耐心操作者的配置,不是生产环境。troubleshooting 章节对此相当诚实。
 - **自定义 checkpoint + 4 处源码补丁**(禁 DSA、REAP expert 重映射、MLA 共享内存修复)意味着你被钉死在特定 vLLM dev build 上。对上游脆弱,但对 SM_121 上的 REAP/NVFP4 模型不可避免。
 
 ## 结论

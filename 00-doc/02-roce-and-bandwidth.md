@@ -124,6 +124,29 @@ PP 每 token 跨 3 个 stage 的通信,吃的是整条链路里**最慢的一环
 
 一句话:**NVLink 是「机箱内高速路(百 GB/s~TB/s)」,RoCE/IB RDMA 是「机房内普通路(几十 GB/s)」,而你现在连普通路都没跑满(TCP 而非 RDMA)。**
 
+### 2.5 谁在用这些通道:NCCL / Socket / NIXL
+
+上面几档是**物理传输层(线怎么传)**;真正调用它们的是**上层通信库**。分清三个词:
+
+- **Socket(TCP/IP)**:操作系统给的**最底层字节流水管**。通用但什么都不懂 —— 不知道你发的是张量、有几个 GPU、要做什么运算。数据路径:显存 → 拷回 CPU → 内核 TCP 栈 → 网卡(即 1.4 节那条慢路径)。
+- **NCCL**(NVIDIA Collective Communications Library):NVIDIA 的**多 GPU 集合通信库**,专为搬张量而生。懂三件 socket 不懂的事:① 懂集合语义(直接提供 `all-reduce`/`all-gather`/`broadcast`);② 懂 GPU 拓扑(自动探测 NVLink/RDMA/socket 并选最快的);③ 能直操显存(配 RDMA 时网卡直读显存、绕过 CPU)。**本项目 PP=3 的 stage 间激活传输就是 NCCL 在做。**
+- **NIXL**(NVIDIA Inference Xfer Library,Dynamo 的一部分):更新的**推理专用搬运库**,做的是**点对点、单边、跨介质**的传输(显存/CPU/NVMe/网络)。典型场景是 **prefill/decode 拆解**——把 KV cache 从 prefill 节点搬到 decode 节点。**本项目暂时用不到**(没做 P/D 拆解)。
+
+**关键:它们是「上下层」不是「二选一」。** NCCL 架在传输之上,socket 只是它最慢的一个后端:
+
+```
+上层:  vLLM 说「做一次 all-reduce / 传 PP 激活」
+         ↓
+中层:  NCCL —— 定算法(ring)、选物理通道
+         ↓  从下面几个后端挑一个:
+下层:  NVLink  >  RDMA(IB/RoCE)  >  TCP Socket
+       (机箱内)    (跨机,绕内核)     (跨机,过内核,最慢)
+```
+
+这正好解释 `.env` 的配置:`NCCL_IB_DISABLE=1` + `NCCL_SOCKET_IFNAME=...` = **上层还是 NCCL 在编排,但被强制退到最底下的 Socket 后端**,没用 RDMA —— 这就是「TCP-over-RoCE」。哪天加了无损交换机、把 `NCCL_IB_DISABLE` 打开,**上层代码一行不改**,NCCL 会自动切到 RDMA 后端,~3× 延迟提升就来自这里。
+
+> **NCCL vs NIXL**:NCCL 管「一次前向内、GPU 间紧耦合的**对称集合通信**」(TP/PP/DP);NIXL 管「服务层 worker 间松耦合的**点对点跨介质搬运**」(P/D 拆解搬 KV)。互补,不替代。即便将来上 NIXL 做 P/D 拆解,KV 跨节点搬**照样走 TCP-over-RoCE 慢链路** —— 所以打通 RDMA 仍是比引入 NIXL 更优先的事。
+
 ---
 
 ## 第三部分:内存带宽的数量级
